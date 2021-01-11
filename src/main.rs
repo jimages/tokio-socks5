@@ -1,14 +1,10 @@
 use byteorder::{BigEndian, WriteBytesExt};
-use std::{io, rc::Rc};
-use std::{
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
-    sync::Arc,
-    time::Duration,
-};
+use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tokio;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
 };
 extern crate pretty_env_logger;
 #[macro_use]
@@ -63,7 +59,7 @@ async fn process(mut socket: TcpStream, address: SocketAddr) -> io::Result<()> {
 /***
  * 与客户端进行协商鉴权
  */
-async fn negotiate(socket: &mut TcpStream, addr: &SocketAddr, buf: &mut [u8]) -> io::Result<()> {
+async fn negotiate(socket: &mut TcpStream, _addr: &SocketAddr, buf: &mut [u8]) -> io::Result<()> {
     // 读取前两个bytes，为ver和nmethods,如果没读取到，则返回错误。
     socket.read_exact(&mut buf[0..2]).await?;
 
@@ -184,34 +180,33 @@ async fn request(mut socket: TcpStream, buf: &mut [u8]) -> io::Result<()> {
     match command {
         0x01 => {
             // 表示连接到对方服务器
-            let mut target_stream = TcpStream::connect(&tg_addr).await?;
+            let target_stream = TcpStream::connect(&tg_addr).await?;
             let local_addr = target_stream.local_addr()?;
-            buf[..3].clone_from_slice(&[0x05u8, 0x00, 0x00]);
-            match local_addr {
-                SocketAddr::V4(addr) => {
-                    buf[3..3 + 4].clone_from_slice(&addr.ip().octets());
-                    buf[7..9].as_mut().write_u16::<BigEndian>(addr.port())?;
-                    socket.write_all(&buf[0..9]).await?;
-                }
-                SocketAddr::V6(addr) => {
-                    buf[3..3 + 16].clone_from_slice(&addr.ip().octets());
-                    buf[3 + 16..3 + 2 + 16]
-                        .as_mut()
-                        .write_u16::<BigEndian>(addr.port())?;
-                    socket.write_all(&buf[0..9]).await?;
-                }
-            }
-            let (mut remote_rx, mut remote_tx) = target_stream.split();
-            let (mut local_rx, mut local_tx) = socket.split();
-            let r2l = tokio::io::copy(&mut remote_rx, &mut local_tx);
-            let l2r = tokio::io::copy(&mut local_rx, &mut remote_tx);
-            let (r2l_result, l2r_result) = tokio::join!(r2l, l2r);
+            send_receipt(0x00_u8, &local_addr, &mut socket).await?;
+            relay_tcp(target_stream, socket).await?;
         }
         0x02 => {
-            // 表示监听
+            // 表示监听,目前是应该只能支持一个imcoming连接的接入.
+            let listen_socket = match tg_addr {
+                SocketAddr::V4(_) => TcpSocket::new_v4()?,
+                SocketAddr::V6(_) => TcpSocket::new_v4()?,
+            };
+            // 由于移动语义,tg_addr要被move到socket.listen中, 于是我们先拷贝一份
+            let addr = tg_addr.clone();
+
+            listen_socket.bind(tg_addr)?;
+
+            // 监听最多听一个连接.
+            let tg_listener = listen_socket.listen(1)?;
+            send_receipt(0x00_u8, &addr, &mut socket).await?;
+
+            // 当我们成功收到一条来自对方的连接之后,我们还要向客户端再发送一次receipt
+            let (imcoming_conn, remote_addr) = tg_listener.accept().await?;
+            send_receipt(0x00_u8, &remote_addr, &mut socket).await?;
+            relay_tcp(imcoming_conn, socket).await?;
         }
         0x03 => {
-            // 表示upd绑定
+            todo!("add support to udp");
         }
         _ => {
             // 不支持的command类型，返回错误码0x07
@@ -223,6 +218,53 @@ async fn request(mut socket: TcpStream, buf: &mut [u8]) -> io::Result<()> {
                 "not supported command.",
             ));
         }
+    };
+    Ok(())
+}
+
+/*
+ * 向客户端发送一个receipt
+ */
+async fn send_receipt(
+    result: u8,
+    socket_addr: &SocketAddr,
+    tg_stream: &mut TcpStream,
+) -> io::Result<bool> {
+    let mut target = [0u8; 21];
+    target[..3].clone_from_slice(&[0x05u8, result, 0x00]);
+
+    match socket_addr {
+        SocketAddr::V4(addr) => {
+            target[3] = 0x01;
+            target[3..7].clone_from_slice(&addr.ip().octets());
+            target[7..9].as_mut().write_u16::<BigEndian>(addr.port())?;
+            tg_stream.write_all(&target[0..9]).await?;
+        }
+        SocketAddr::V6(addr) => {
+            target[3] = 0x04;
+            target[3..19].clone_from_slice(&addr.ip().octets());
+            target[19..21]
+                .as_mut()
+                .write_u16::<BigEndian>(addr.port())?;
+            tg_stream.write_all(&target[0..21]).await?;
+        }
+    };
+    Ok(true)
+}
+
+/*
+ * 将两个tcp数据串起来,两个tcpstream数据之间相互转发数据
+ */
+async fn relay_tcp(mut stream1: TcpStream, mut stream2: TcpStream) -> io::Result<()> {
+    // 按照socks5协议,在监听模式中,在接受到一个新的连接的时候,代理服务器就再发一个receipt
+    let (mut remote_rx, mut remote_tx) = stream1.split();
+    let (mut local_rx, mut local_tx) = stream2.split();
+    let r2l = tokio::io::copy(&mut remote_rx, &mut local_tx);
+    let l2r = tokio::io::copy(&mut local_rx, &mut remote_tx);
+    let result = tokio::try_join!(r2l, l2r);
+    if let Err(_) = result {
+        // 如果任意一端出现了错误,那么就静默的关闭连接即可,以防客户端把数据当做目的服务器的数据
+        return Err(io::Error::new(io::ErrorKind::Other, "unsupported address"));
     };
     Ok(())
 }
